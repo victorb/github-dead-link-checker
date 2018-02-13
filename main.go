@@ -4,12 +4,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/fatih/color"
@@ -47,10 +51,24 @@ func urlIsOK(URL string) (bool, string, error) {
 	if err != nil {
 		return false, "Fatal Error", err
 	}
-	// Method not allowed
+	// Method not allowed - retry with get but short timeout
 	if response.StatusCode == 405 {
-		// try with get but with timeout both
-		// before and after first received byte?
+		timeout := time.Duration(5 * time.Second)
+		client := http.Client{
+			Timeout: timeout,
+		}
+		response, err = client.Get(URL)
+		if err != nil {
+			return false, "Fatal Error", err
+		}
+	}
+	// We're being rate-limited...
+	if response.StatusCode == 429 {
+		randomTimeout := rand.Intn(60)
+		r := strconv.Itoa(randomTimeout)
+		color.Yellow("Warning, " + URL + " check is being rate-limited, retrying in " + r + " seconds")
+		time.Sleep(time.Duration(randomTimeout) * time.Second)
+		return urlIsOK(URL)
 	}
 	if response.StatusCode == 200 {
 		return true, "", nil
@@ -59,7 +77,12 @@ func urlIsOK(URL string) (bool, string, error) {
 }
 
 func main() {
+	token := os.Getenv("GH_SECRET")
+	if token == "" {
+		log.Fatal("Environment variable `GH_SECRET` needs to be set")
+	}
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	var workers = flag.Int("workers", 10, "Number of workers to concurrently check links")
 	flag.Parse()
 
@@ -84,7 +107,6 @@ func main() {
 			Name:         split[1],
 		})
 	}
-	token := os.Getenv("GH_SECRET")
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
@@ -105,6 +127,9 @@ func main() {
 				Name:         repo.GetName(),
 			})
 		}
+	}
+	if len(reposToTest) == 0 {
+		log.Fatal("You need to specify which organizations or repositories you want to check")
 	}
 	errors := []string{}
 	errorCh := make(chan string)
