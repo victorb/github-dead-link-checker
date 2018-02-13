@@ -2,17 +2,45 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"strings"
+	"sync"
 
 	"github.com/davecgh/go-spew/spew"
-	mdParser "github.com/nikitavoloboev/markdown-parser/parser"
+	"github.com/fatih/color"
 
 	"github.com/google/go-github/github"
 	"golang.org/x/oauth2"
+
+	mdParser "github.com/nikitavoloboev/markdown-parser/parser"
 )
+
+type Repository struct {
+	Organization string
+	Name         string
+}
+
+type CheckLink struct {
+	Repository Repository
+	Link       string
+	Result     string
+}
+
+func (j *Repository) GetFullName() string {
+	return j.Organization + "/" + j.Name
+}
+
+func (j *Repository) SetFullName(name string) *Repository {
+	split := strings.Split(name, "/")
+	j.Organization = split[0]
+	j.Name = split[1]
+	return j
+}
 
 func urlIsOK(URL string) (bool, string, error) {
 	response, err := http.Head(URL)
@@ -31,6 +59,31 @@ func urlIsOK(URL string) (bool, string, error) {
 }
 
 func main() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	var workers = flag.Int("workers", 10, "Number of workers to concurrently check links")
+	flag.Parse()
+
+	args := flag.Args()
+	reposToTest := []Repository{}
+	wantedOrgs := []string{}
+	wantedRepos := []string{}
+	for _, arg := range args {
+		if strings.Contains(arg, "/") {
+			fmt.Printf("Using `%s` as a repository\n", arg)
+			wantedRepos = append(wantedRepos, arg)
+		} else {
+			fmt.Printf("Using `%s` as a organization\n", arg)
+			wantedOrgs = append(wantedOrgs, arg)
+		}
+	}
+	fmt.Println()
+	for _, repo := range wantedRepos {
+		split := strings.Split(repo, "/")
+		reposToTest = append(reposToTest, Repository{
+			Organization: split[0],
+			Name:         split[1],
+		})
+	}
 	token := os.Getenv("GH_SECRET")
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
@@ -41,28 +94,76 @@ func main() {
 	client := github.NewClient(tc)
 
 	// list all repositories for the authenticated user
-	repos, _, err := client.Repositories.ListByOrg(ctx, "ipfs", nil)
-	if err != nil {
-		panic(err)
-	}
-	for _, repo := range repos {
-		fullName := repo.GetFullName()
-		fmt.Println("## https://github.com/" + fullName)
-		file, _, err := client.Repositories.GetReadme(ctx, "ipfs", repo.GetName(), nil)
+	for _, org := range wantedOrgs {
+		repos, _, err := client.Repositories.ListByOrg(ctx, org, nil)
 		if err != nil {
 			panic(err)
+		}
+		for _, repo := range repos {
+			reposToTest = append(reposToTest, Repository{
+				Organization: org,
+				Name:         repo.GetName(),
+			})
+		}
+	}
+	errors := []string{}
+	errorCh := make(chan string)
+	go func() {
+		for {
+			err := <-errorCh
+			errors = append(errors, err)
+		}
+	}()
+	linksToCheck := make(chan CheckLink)
+	red := color.New(color.FgRed).SprintFunc()
+	green := color.New(color.FgGreen).SprintFunc()
+	var wg sync.WaitGroup
+	for i := 0; i < *workers; i++ {
+		go func() {
+			for {
+				link := <-linksToCheck
+				isOK, errMsg, err := urlIsOK(link.Link)
+				if err != nil {
+					errMsg = err.Error()
+					spew.Dump(err)
+					isOK = false
+				}
+				text := red("  FAIL ")
+				if isOK {
+					text = green("  OK   ")
+				}
+				fullName := link.Repository.GetFullName()
+				text = text + fullName + " " + link.Link
+				if !isOK {
+					text = text + " - " + errMsg
+					errorCh <- text
+				}
+				fmt.Println(text)
+				wg.Done()
+			}
+		}()
+	}
+	for _, repo := range reposToTest {
+		fullName := repo.GetFullName()
+		file, _, err := client.Repositories.GetReadme(ctx, repo.Organization, repo.Name, nil)
+		if err != nil {
+			if strings.Contains(err.Error(), "404 Not Found") {
+				continue
+			} else {
+				panic(err)
+			}
 		}
 		fileContent, err := file.GetContent()
 		if err != nil {
 			panic(err)
 		}
 		links := mdParser.GetAllLinks(fileContent)
+		parsedLinks := []string{}
 		for _, link := range links {
-			// if link is not starting with http, it's a relative link
-			// / is absolute link
-			// img/ipfs-alpha-video.png
-			// github.com/ipfs/ipfs/blob/master/img/ipfs-alpha-video.png
 			l, err := url.Parse(link)
+			if err != nil {
+				panic(err)
+			}
 			if l.Scheme == "" && l.Hostname() != "" {
 				link = "https:" + link
 			}
@@ -70,21 +171,26 @@ func main() {
 			if l.Hostname() == "" {
 				link = "https://github.com/" + fullName + "/blob/master/" + link
 			}
-			isOK, errMsg, err := urlIsOK(link)
-			if err != nil {
-				errMsg = err.Error()
-				spew.Dump(err)
-				isOK = false
-			}
-			text := "FAIL"
-			if isOK {
-				text = "OK"
-			}
-			text = "  " + text + "  " + link
-			if !isOK {
-				text = text + " - " + errMsg
-			}
-			fmt.Println(text)
+			parsedLinks = append(parsedLinks, link)
 		}
+		wg.Add(len(parsedLinks))
+		for _, link := range parsedLinks {
+			cl := CheckLink{}
+			cl.Repository.SetFullName(fullName)
+			cl.Link = link
+			go func() {
+				linksToCheck <- cl
+			}()
+		}
+	}
+	wg.Wait()
+	if len(errors) > 0 {
+		fmt.Println()
+		fmt.Println("ALL ERRORS:")
+		for _, err := range errors {
+			fmt.Println(err)
+		}
+	} else {
+		fmt.Println("All good, found no broken links")
 	}
 }
