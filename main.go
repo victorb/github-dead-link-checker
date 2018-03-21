@@ -47,16 +47,16 @@ func (j *Repository) SetFullName(name string) *Repository {
 }
 
 func urlIsOK(URL string) (bool, string, error) {
-	response, err := http.Head(URL)
+	timeout := time.Duration(10 * time.Second)
+	client := http.Client{
+		Timeout: timeout,
+	}
+	response, err := client.Head(URL)
 	if err != nil {
 		return false, "Fatal Error", err
 	}
 	// Method not allowed - retry with get but short timeout
 	if response.StatusCode == 405 {
-		timeout := time.Duration(5 * time.Second)
-		client := http.Client{
-			Timeout: timeout,
-		}
 		response, err = client.Get(URL)
 		if err != nil {
 			return false, "Fatal Error", err
@@ -210,11 +210,21 @@ func main() {
 	}
 	wg.Wait()
 	if len(errors) > 0 {
+		// title := "Broken links in README"
+		// body := "The following links from the README are currently broken and needs fixing:\n"
+		// labels := []string{"help wanted"}
 		fmt.Println()
 		fmt.Println("ALL ERRORS:")
 		for _, err := range errors {
 			fmt.Println(err)
+			// body = body + "- " + err + "\n"
 		}
+		// issue := github.IssueRequest{}
+		// issue.Title = &title
+		// issue.Body = &body
+		// issue.Labels = &labels
+		// Open a PR with errors for this repository
+		// client.Issues.Create(ctx, owner, repo, issue)
 	} else {
 		fmt.Println("All good, found no broken links")
 	}
